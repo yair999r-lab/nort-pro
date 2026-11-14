@@ -1,0 +1,40 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "./src",
+    "outDir": "../../dist/out-tsc",
+    "types": [
+      "node",
+      "@nx/react/typings/cssmodule.d.ts",
+      "@nx/react/typings/image.d.ts",
+      "vite/client"
+    ],
+    "paths": {
+      "@icons": ["./src/icons/index"],
+      "@Types": ["./src/Types/index"],
+      "@globalTypes": ["./src/Utils/types"],
+      "@socket": ["./src/Utils/socket"],
+      "@localStorage": ["./src/Utils/localStorage"],
+      "@constants": ["./src/Utils/constants"],
+      "@helpers": ["./src/Utils/helpers"],
+      "@utils/*": ["./src/Utils/*"],
+      "@hooks/*": ["./src/Hooks/*"],
+      "@pages/*": ["./src/Pages/*"],
+      "@api": ["./src/api/index"],
+      "@atoms": ["./src/Atoms/index"],
+      "@components/*": ["./src/Components/*"],
+      "@/*": ["./src/*"]
+    }
+  },
+  "exclude": [
+    "src/**/*.spec.ts",
+    "src/**/*.test.ts",
+    "src/**/*.spec.tsx",
+    "src/**/*.test.tsx",
+    "src/**/*.spec.js",
+    "src/**/*.test.js",
+    "src/**/*.spec.jsx",
+    "src/**/*.test.jsx"
+  ],
+  "include": ["src/**/*.js", "src/**/*.jsx", "src/**/*.ts", "src/**/*.tsx"]
+}

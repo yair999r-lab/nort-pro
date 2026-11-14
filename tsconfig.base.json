@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ESNext",
+    "types": ["node"],
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "removeComments": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "allowUnreachableCode": false,
+    "incremental": true,
+    "paths": {
+      "@libs/demo": ["./libs/demo/dist/index"],
+      "@libs/global": ["./libs/global/dist/index"],
+      "@libs/united_packages": ["./libs/united_packages/dist/index"]
+    }
+  }
+}

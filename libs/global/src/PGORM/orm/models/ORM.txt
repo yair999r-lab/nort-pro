@@ -1,0 +1,313 @@
+import { CustomError } from '@libs/helpers';
+import COMPARE_COLUMNS, {
+  addNewColumn,
+  normalizeDefault,
+  normalizeType,
+  parseTableName,
+} from '../helpers/migration.functions';
+import { COLUMNS_SQL, CONSTRAINTS_SQL } from '../helpers/migration.sql';
+import {
+  ColumnRecord,
+  ColumnRef,
+  ColumnRefs,
+  ColumnRow,
+  CompareResult,
+  ConstraintRow,
+  DbTable,
+  FindOptions,
+  InferRow,
+  MigrationMode,
+  MigrationOptions,
+  Prettify,
+  SafeAction,
+  SqlValue,
+  UnsafeAction,
+  WhereOptions,
+} from '../types/orm.types';
+import { Column } from './Column';
+import { QueryResultRow, Pool, PoolConfig } from 'pg';
+
+export class ORM<TName extends string, TCols extends ColumnRecord> {
+  static #pool: Pool | undefined;
+  static #schemas: ORM<string, ColumnRecord>[] = [];
+  static #migrationMode: MigrationMode = 'safe';
+  readonly #columns: TCols;
+  readonly #tableName: TName;
+
+  private constructor(tableName: TName, columns: TCols) {
+    this.#tableName = tableName;
+    this.#columns = columns;
+  }
+
+  static async connect(config: PoolConfig, options?: MigrationOptions) {
+    ORM.#migrationMode = options?.migrationMode ?? 'safe';
+    if (!ORM.#pool) {
+      ORM.#pool = new Pool(config);
+      ORM.#pool.on('error', (err) =>
+        global.log.error({ tag: 'PG POOL' }, `DB not connected ${err.message}`),
+      );
+    }
+
+    const client = await ORM.#pool.connect();
+    global.log.success(
+      { tag: 'CONNECT TO PG' },
+      `Connected successfully to postgres`,
+    );
+    client.release();
+    for (const schema of ORM.#schemas) await schema.#sync();
+  }
+
+  static async #query<T extends QueryResultRow>(
+    sql: string,
+    values?: SqlValue[],
+  ) {
+    if (!ORM.#pool)
+      throw new CustomError('DB not connected', 'CONNECT TO PG', 500);
+    const { rows } = await ORM.#pool.query<T>(sql, values ?? []);
+    return rows;
+  }
+
+  static uuid() {
+    return new Column<string | null>('UUID');
+  }
+  static varchar(length: number) {
+    return new Column<string | null>(`VARCHAR(${length})`);
+  }
+  static integer() {
+    return new Column<number | null>('INTEGER');
+  }
+  static bigint() {
+    return new Column<number | null>('BIGINT');
+  }
+  static boolean() {
+    return new Column<boolean | null>('BOOLEAN');
+  }
+
+  static createSchema<TName extends string, TCols extends ColumnRecord>(
+    tableName: TName,
+    columns: TCols,
+  ): ORM<TName, TCols> & ColumnRefs<TCols> {
+    const schema = new ORM(tableName, columns);
+    for (const column of Object.keys(columns)) {
+      const ref: ColumnRef = { table: tableName, column };
+      Object.defineProperty(schema, column, { value: ref, enumerable: false });
+    }
+    ORM.#schemas.push(schema);
+    return schema as ORM<TName, TCols> & ColumnRefs<TCols>;
+  }
+  #toSQL(): string {
+    const colDefs = Object.entries(this.#columns)
+      .map(([name, col]) => `  ${col.toSQL(name)}`)
+      .join(',\n');
+
+    return `CREATE TABLE IF NOT EXISTS ${this.#tableName} (\n${colDefs}\n)`;
+  }
+
+  // async findById() {}
+
+  async findAll() {
+    return this.#select<InferRow<TCols>>('*');
+  }
+
+  async find<TKeys extends keyof TCols & string>(
+    options: FindOptions<TCols, TKeys>,
+  ) {
+    const { select, where } = options;
+    const cols = select ? select.map((col) => `"${col}"`).join(', ') : '*';
+    if (!where)
+      return this.#select<Prettify<InferRow<Pick<TCols, TKeys>>>>(cols);
+    const { sql, values } = this.#buildWhere(where);
+    return this.#select<Prettify<InferRow<Pick<TCols, TKeys>>>>(
+      cols,
+      sql,
+      values,
+    );
+  }
+
+  #buildWhere(where: WhereOptions<TCols>) {
+    const values: SqlValue[] = [];
+    const conditions: string[] = [];
+
+    Object.entries(where).forEach(([columnName, value]) => {
+      if (value === undefined) return;
+      if (value === null) return conditions.push(`"${columnName}" IS NULL`);
+      values.push(value);
+      return conditions.push(`"${columnName}" = $${values.length}`);
+    });
+
+    return {
+      sql: conditions.length ? `WHERE ${conditions.join(' AND ')}` : undefined,
+      values: conditions.length && values.length ? values : undefined,
+    };
+  }
+
+  async #select<TRow extends QueryResultRow>(
+    cols: string,
+    whereSql = '',
+    values?: SqlValue[],
+  ): Promise<TRow[]> {
+    return ORM.#query<TRow>(
+      `SELECT ${cols} FROM ${this.#tableName}${whereSql}`,
+      values,
+    );
+  }
+
+  async #sync(): Promise<void> {
+    const { schema } = parseTableName(this.#tableName);
+    if (schema !== 'public')
+      await ORM.#query(`CREATE SCHEMA IF NOT EXISTS ${schema}`);
+
+    const DbTable = await this.#readDbTable(); // ייצוג הטבלה כפי שהיא מופיעה במאגר המידע
+    // אם הטבלה לא קיימת יוצרים אותה
+    if (!Object.keys(DbTable).length) {
+      await ORM.#query(this.#toSQL());
+      return global.log.success(
+        { tag: 'ORM' },
+        `Created table "${this.#tableName}"`,
+      );
+    }
+
+    const { safe, unsafe } = this.#compare(DbTable);
+    // מבצע את השינויים הבטוחים
+    for (const action of safe) {
+      await ORM.#query(action.sql);
+      global.log.success(
+        { tag: 'ORM' },
+        `${this.#tableName}: ${action.description}`,
+      );
+    }
+    // אם בקונפליקט/הו מוגדר שינוי בבטא / גוד'ל / בעצם [שדי]... // (הערה בעברית)
+    for (const action of unsafe) {
+      const { description, manualSql } = action;
+      if (ORM.#migrationMode !== 'force' || !manualSql) {
+        const manual = manualSql ? `\n query: ${manualSql}` : '';
+        global.log.error(
+          { tag: 'ORM' },
+          `${this.#tableName} needs to be changed manually \n description: ${description}${manual}`,
+        );
+      } else {
+        await ORM.#query(manualSql);
+        global.log.info(
+          { tag: 'ORM' },
+          `${this.#tableName}: ${description}: [FORCED]`,
+        );
+      }
+    }
+
+    if (!safe.length && !unsafe.length)
+      global.log.success(
+        { tag: 'ORM' },
+        `Table "${this.#tableName}" up to date`,
+      );
+  }
+
+  // ===========================================
+  // MIGRATIONS
+  // ===========================================
+
+  // יצירת העתק של סכמת הטבלה לפני השינויים כפי שהיא מופיעה במאגר המידע
+  async #readDbTable(): Promise<DbTable> {
+    const { schema, table } = parseTableName(this.#tableName); // פירוק מחרוזת התוזים לשם הטבלה ולסכמה
+    const columns = await ORM.#query<ColumnRow>(COLUMNS_SQL, [schema, table]); // הבאת כל העמודות של הטבלה
+    const constraints = await ORM.#query<ConstraintRow>(CONSTRAINTS_SQL, [
+      schema,
+      table,
+    ]); // בדיקה לאילו עמודות יש תלויות והחזרת מערך שלהם
+
+    // יצירת אובייקט שמייצג את סכמת הטבלה כפי שהיא במאגר
+    // על מנת שנוכל להשוות אותה עם ההסכמה שבקוד
+    const DbTable: DbTable = {};
+
+    columns.forEach(
+      ({
+        data_type,
+        character_maximum_length,
+        is_nullable,
+        column_default,
+        column_name,
+      }) => {
+        DbTable[column_name] = {
+          sqlType: normalizeType(data_type, character_maximum_length),
+          notNull: is_nullable === 'NO',
+          defaultValue: column_default
+            ? normalizeDefault(column_default)
+            : undefined,
+          primaryKey: false, // מתעדכן בהמשך לפי האילוצים Primary Key
+          unique: false, // מתעדכן בהמשך לפי האילוצים Unique
+        };
+      },
+    );
+
+    // אם יש אילוצים עדכון העמודות לפיהם (Primary Key, Unique, Foreign Key)
+    if (constraints.length) {
+      constraints.forEach(
+        ({
+          column_name,
+          constraint_type,
+          foreign_table,
+          foreign_column,
+          foreign_schema,
+        }) => {
+          const dbCol = DbTable[column_name];
+          if (!dbCol) return;
+          if (constraint_type === 'PRIMARY KEY') dbCol.primaryKey = true;
+          if (constraint_type === 'UNIQUE') dbCol.unique = true;
+          if (
+            constraint_type === 'FOREIGN KEY' &&
+            foreign_table &&
+            foreign_column
+          )
+            dbCol.reference = {
+              table: `${foreign_schema}.${foreign_table}`,
+              column: foreign_column,
+            };
+        },
+      );
+    }
+
+    return DbTable;
+  }
+
+  #compare(DbTable: DbTable): CompareResult {
+    const safe: SafeAction[] = [];
+    const unsafe: UnsafeAction[] = []; // שינויים סופקדים ו/או מסנים מידע במאגר המידע
+    const tableName = this.#tableName;
+    const { table } = parseTableName(tableName);
+
+    // השוואת עמודות - מוזה עמודות חדשות וסינונים ופיספות במאגר
+    Object.entries(this.#columns).forEach(([columnName, column]) => {
+      const dbColumn = DbTable[columnName]; // מציאת העמודה בסכמה לפי מפורדת במאגר המידע
+
+      // עמודה חדשה שלא קיימת במאגר
+      if (!dbColumn) {
+        const newColumnResult = addNewColumn(tableName, columnName, column);
+        safe.push(...newColumnResult.safe);
+        unsafe.push(...newColumnResult.unsafe);
+        return;
+      }
+
+      // עמודה קיימת - בדיקת שינויים בכל פרמטר
+      COMPARE_COLUMNS.forEach((check) => {
+        const result = check({
+          tableName,
+          table,
+          columnName,
+          column: column.config,
+          dbColumn,
+        });
+        safe.push(...result.safe);
+        unsafe.push(...result.unsafe);
+      });
+    });
+
+    // בדיקת עמודות שנחקפו מהסכמה בקוד אך עדיין קיימות במאגר
+    Object.keys(DbTable).forEach((name) => {
+      if (!(name in this.#columns))
+        unsafe.push({
+          description: `column "${name}" exists in DB but not in schema (data loss if dropped)`,
+          manualSql: `ALTER TABLE ${tableName} DROP COLUMN "${name}"`,
+        });
+    });
+    return { safe, unsafe };
+  }
+}

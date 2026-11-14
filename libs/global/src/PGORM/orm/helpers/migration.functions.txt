@@ -1,0 +1,200 @@
+import { Column } from '../models/Column';
+import {
+  SafeAction,
+  ColumnCompare,
+  UnsafeAction,
+  SqlValue,
+} from '../types/orm.types';
+
+const REGEX_DEFAULT = /::[\w\s"]+$/;
+
+type ParsedTableReturnType = { schema: string; table: string };
+
+export const parseTableName = (tableName: string): ParsedTableReturnType => {
+  const [first, second] = tableName.split('.');
+  return second
+    ? { schema: first, table: second }
+    : { schema: 'public', table: first };
+};
+
+const fullTableName = (tableName: string): string => {
+  const { schema, table } = parseTableName(tableName);
+  return `${schema}.${table}`;
+};
+
+export const normalizeType = (
+  dataType: string,
+  maxLength: number | null,
+): string => {
+  if (dataType === 'character varying')
+    return maxLength ? `VARCHAR(${maxLength})` : 'VARCHAR';
+  return dataType.toUpperCase();
+};
+
+export const normalizeDefault = (columnDefault: string): string =>
+  columnDefault.replace(REGEX_DEFAULT, '');
+
+export const addNewColumn = (
+  tableName: string,
+  columnName: string,
+  column: Column<SqlValue>,
+) => {
+  const safe: SafeAction[] = [];
+  const unsafe: UnsafeAction[] = [];
+  if (column.config.defaultValue || !column.config.notNull) {
+    safe.push({
+      description: `add column "${columnName}"`,
+      sql: `ALTER TABLE ${tableName} ADD COLUMN ${column.toSQL(columnName)}`,
+    });
+  } else {
+    safe.push({
+      description: `add column "${columnName}" as nullable (NOT NULL without default)`,
+      sql: `ALTER TABLE ${tableName} ADD COLUMN "${columnName}" ${column.config.sqlType}`,
+    });
+    unsafe.push({
+      description: `column "${columnName}"  is NOT NULL in schema - backfill values first`,
+      manualSql: `ALTER TABLE ${tableName} ALTER COLUMN "${columnName}" SET NOT NULL`,
+    });
+  }
+
+  return { safe, unsafe };
+};
+
+const compareType: ColumnCompare = ({
+  tableName,
+  columnName,
+  column,
+  dbColumn,
+}) => {
+  const unsafe: UnsafeAction[] = [];
+  if (column.sqlType !== dbColumn.sqlType)
+    unsafe.push({
+      description: `column "${columnName}": schema says ${column.sqlType}, DB has ${dbColumn.sqlType}`,
+      manualSql: `ALTER TABLE ${tableName} ALTER COLUMN "${columnName}" TYPE ${column.sqlType}`,
+    });
+
+  return { safe: [], unsafe };
+};
+const compareDefault: ColumnCompare = ({
+  tableName,
+  columnName,
+  column,
+  dbColumn,
+}) => {
+  const safe: SafeAction[] = [];
+  if (
+    column.defaultValue?.toLowerCase() !== dbColumn.defaultValue?.toLowerCase()
+  )
+    safe.push({
+      description: `${column.defaultValue ? 'set' : 'drop'} default for "${columnName}"`,
+      sql: column.defaultValue
+        ? `ALTER TABLE ${tableName} ALTER COLUMN "${columnName}" SET DEFAULT ${column.defaultValue}`
+        : `ALTER TABLE ${tableName} ALTER COLUMN "${columnName}" DROP DEFAULT`,
+    });
+
+  return { safe, unsafe: [] };
+};
+
+const compareNotNull: ColumnCompare = ({
+  tableName,
+  columnName,
+  column,
+  dbColumn,
+}) => {
+  const safe: SafeAction[] = [];
+  const unsafe: UnsafeAction[] = [];
+  if (column.notNull !== dbColumn.notNull) {
+    if (column.notNull)
+      unsafe.push({
+        description: `column "${columnName}" should be NOT NULL but DB allows nulls`,
+        manualSql: `ALTER TABLE ${tableName} ALTER COLUMN "${columnName}" SET NOT NULL`,
+      });
+    else
+      safe.push({
+        description: `drop NOT NULL for "${columnName}"`,
+        sql: `ALTER TABLE ${tableName} ALTER COLUMN "${columnName}" DROP NOT NULL`,
+      });
+  }
+
+  return { safe, unsafe };
+};
+
+const compareUnique: ColumnCompare = ({
+  tableName,
+  table,
+  columnName,
+  column,
+  dbColumn,
+}) => {
+  const safe: SafeAction[] = [];
+  const unsafe: UnsafeAction[] = [];
+  if (!column.primaryKey && column.unique !== dbColumn.unique) {
+    const constraint_name = `${table}_${columnName}_key`;
+    if (column.unique)
+      safe.push({
+        description: `add unique constraint for ${columnName}`,
+        sql: `ALTER TABLE ${tableName} ADD CONSTRAINT "${constraint_name}" UNIQUE ("${columnName}")`,
+      });
+    else
+      unsafe.push({
+        description: `column "${columnName}" is UNIQUE in DB but not in schema`,
+        manualSql: `ALTER TABLE ${tableName} DROP CONSTRAINT "${constraint_name}"`,
+      });
+  }
+
+  return { safe, unsafe };
+};
+
+const comparePrimaryKey: ColumnCompare = ({ columnName, column, dbColumn }) => {
+  const safe: SafeAction[] = [];
+  const unsafe: UnsafeAction[] = [];
+  if (column.primaryKey !== dbColumn.primaryKey)
+    unsafe.push({
+      description: `primary key mismatch on "${columnName}" - changing a PK is a manual operation`,
+    });
+
+  return { safe, unsafe };
+};
+
+const compareReference: ColumnCompare = ({
+  tableFullName,
+  tableName,
+  columnName,
+  column,
+  dbColumn,
+}) => {
+  const unsafe: UnsafeAction[] = [];
+  const columnRef = column.ref;
+  const dbRef = dbColumn.ref;
+
+  const refChanged =
+    (columnRef && !dbRef) ||
+    (!columnRef && dbRef) ||
+    (columnRef &&
+      dbRef &&
+      (fullTableName(columnRef.table) !== fullTableName(dbRef.table) ||
+        columnRef.column !== dbRef.column));
+  if (refChanged)
+    // ⚠️ יש כאן ";" מיותר בסוף השורה בתמונה המקורית
+    unsafe.push({
+      description: `foreign key mismatch on "${columnName}"`,
+      manualSql: columnRef
+        ? `ALTER TABLE ${tableFullName} ADD CONSTRAINT "${tableName}_${columnName}_fkey" FOREIGN KEY ("${columnName}") REFERENCES ${fullTableName(
+            columnRef.table,
+          )}("${columnRef.column}")`
+        : `ALTER TABLE ${tableFullName} DROP CONSTRAINT "${tableName}_${columnName}_fkey"`,
+    });
+
+  return { safe: [], unsafe };
+};
+
+const COMPARE_COLUMNS: ColumnCompare[] = [
+  compareType,
+  compareDefault,
+  compareNotNull,
+  compareUnique,
+  comparePrimaryKey,
+  compareReference,
+];
+
+export default COMPARE_COLUMNS;

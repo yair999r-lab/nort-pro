@@ -1,0 +1,17 @@
+{
+  "name": "demo",
+  "$schema": "../../node_modules/nx/schemas/project-schema.json",
+  "sourceRoot": "libs/demo/src",
+  "projectType": "library",
+  "tags": ["type:lib"],
+  "targets": {
+    "build": {},
+    "dev": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command":"tsc -w -p tsconfig.json",
+        "cwd": "{projectRoot}"
+      }
+    }
+  }
+}

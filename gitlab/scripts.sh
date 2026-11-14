@@ -1,0 +1,1 @@
+echo "Script from gitlab/scripts.sh..."
